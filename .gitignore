@@ -1,0 +1,10 @@
+backend/t.py
+backend/test.py
+backend/test1.py
+backend/test2.py
+backend/test3.py
+backend/en_US-lessac-medium.onnx
+backend/en_US-lessac-medium.onnx.json
+frontend/node_modules/
+frontend/package-lock.json
+frontend/package.json
