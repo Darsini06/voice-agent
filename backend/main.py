@@ -24,8 +24,8 @@ import google.generativeai as genai
 # CONFIG
 # =============================
 
-MONGODB_URL = ""
-GEMINI_API_KEY = ""
+MONGODB_URL = "mongodb+srv://Darsini:Muruga27@voice-agent.rfvpkvc.mongodb.net/?appName=voice-agent"
+GEMINI_API_KEY = "AIzaSyA2ezQlB-3WJ5_Jhyyo3wXUOSsRVWpjmqM"
 
 SAMPLE_RATE = 16000
 FRAME_DURATION = 30
@@ -83,7 +83,7 @@ class AddMessageRequest(BaseModel):
 # Gemini Setup
 # =============================
 
-genai.configure(api_key="")
+genai.configure(api_key="AIzaSyA2ezQlB-3WJ5_Jhyyo3wXUOSsRVWpjmqM")
 gemini_model = genai.GenerativeModel("models/gemini-2.5-flash")
 
 # =============================
