@@ -28,7 +28,7 @@ import google.generativeai as genai
 # =============================
 
 MONGODB_URL = "mongodb+srv://Darsini:Muruga27@voice-agent.rfvpkvc.mongodb.net/?appName=voice-agent"
-GEMINI_API_KEY = "AIzaSyCYMxg4vjgZptFV9hJWvQvp-SWmOZWFMw8"  
+GEMINI_API_KEY = "AIzaSyBuycqWwCSJcZ08SSme3hGR3pF7xuqdIEY"  
 
 SAMPLE_RATE = 16000
 FRAME_DURATION = 30
