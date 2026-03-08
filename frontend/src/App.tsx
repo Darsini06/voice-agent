@@ -3,7 +3,7 @@ import React from 'react';
 import { VoiceSidebar } from './components/VoiceSidebar';
 import { VoiceChatInterface } from './components/VoiceChatInterface';
 import { useVoiceWebSocket } from './hooks/useVoiceWebSocket';  // ← Change this!
-import { Wifi, WifiOff, Mic } from 'lucide-react'; 
+import { Wifi, WifiOff, Mic } from 'lucide-react';
 
 function App() {
   const {
@@ -15,12 +15,13 @@ function App() {
     isProcessing,
     currentTranscript,
     isConnected,
+    audioLevel,          // FIX: now exposed by hook
     createNewChat,
     selectChat,
     deleteChat,
     startListening,
     stopListening
-  } = useVoiceWebSocket();  // ← This stays the same
+  } = useVoiceWebSocket();
   return (
     <div className="flex h-screen bg-gray-950">
       {/* Connection Status */}
@@ -46,7 +47,7 @@ function App() {
         onSelectChat={selectChat}
         onDeleteChat={deleteChat}
       />
-      
+
       <div className="flex-1">
         {currentChat ? (
           <VoiceChatInterface
@@ -56,6 +57,8 @@ function App() {
             isListening={isListening}
             isSpeaking={isSpeaking}
             isProcessing={isProcessing}
+            isConnected={isConnected}     // FIX: was missing — disconnected banner never showed
+            audioLevel={audioLevel}       // FIX: was missing — visualizer was always flat
             currentTranscript={currentTranscript}
             onStartListening={startListening}
             onStopListening={stopListening}

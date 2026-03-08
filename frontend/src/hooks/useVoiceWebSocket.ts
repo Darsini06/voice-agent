@@ -1,12 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Message, Chat } from '../types';
 
 const API_URL = 'http://localhost:8000';
 const WS_URL = 'ws://localhost:8000/ws/voice';
 
 export const useVoiceWebSocket = () => {
-  console.log('🔄 useVoiceWebSocket hook initializing');
-
   // ── States
   const [chats, setChats] = useState<Chat[]>([]);
   const [currentChatId, setCurrentChatId] = useState<string | null>(null);
@@ -15,196 +13,311 @@ export const useVoiceWebSocket = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [currentTranscript, setCurrentTranscript] = useState('');
   const [isConnected, setIsConnected] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
 
-  // ── Refs
+  // ── Refs (stable across renders)
   const wsRef = useRef<WebSocket | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
   const initSentRef = useRef<boolean>(false);
+  const currentChatIdRef = useRef<string | null>(null);
+
+  // Audio pipeline
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  // ── Fetch chats once on mount
+  // Audio playback queue
+  const audioQueueRef = useRef<string[]>([]);
+  const isPlayingRef = useRef<boolean>(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // KEY FIX: When mic button is clicked and WS isn't open yet,
+  // set this flag so ws.onopen starts the mic automatically.
+  const pendingMicStartRef = useRef<boolean>(false);
+
+  // Keep ref in sync with state so callbacks always read the latest chatId
+  useEffect(() => {
+    currentChatIdRef.current = currentChatId;
+  }, [currentChatId]);
+
+  // ── Fetch chats on mount
   useEffect(() => {
     fetchChats();
   }, []);
 
+  // ── WebSocket: open/replace whenever the selected chat changes
+  // This is the ONLY place that creates a WebSocket.
+  // startListening never creates its own — it sets pendingMicStartRef instead.
+  useEffect(() => {
+    if (!currentChatId) return;
+    openWebSocket(currentChatId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentChatId]);
+
+  // ── Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopMicrophoneStream();
+      closeWebSocket();
+    };
+  }, []);
+
+  // ─────────────────────────────────────────────────────
+  // WebSocket helpers
+  // ─────────────────────────────────────────────────────
+
+  const closeWebSocket = () => {
+    if (wsRef.current) {
+      wsRef.current.onopen = null;
+      wsRef.current.onmessage = null;
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      if (
+        wsRef.current.readyState === WebSocket.OPEN ||
+        wsRef.current.readyState === WebSocket.CONNECTING
+      ) {
+        wsRef.current.close();
+      }
+      wsRef.current = null;
+    }
+    initSentRef.current = false;
+    setIsConnected(false);
+  };
+
+  // openWebSocket is the single source-of-truth for WS creation.
+  // It is called by the useEffect above — never by startListening directly.
+  const openWebSocket = (chatId: string) => {
+    console.log(`🔌 openWebSocket chatId=${chatId}`);
+
+    // Null out handlers before closing so old close-event can't fire
+    if (wsRef.current) {
+      wsRef.current.onopen = null;
+      wsRef.current.onmessage = null;
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      if (
+        wsRef.current.readyState === WebSocket.OPEN ||
+        wsRef.current.readyState === WebSocket.CONNECTING
+      ) {
+        wsRef.current.close();
+      }
+      wsRef.current = null;
+    }
+    initSentRef.current = false;
+
+    const ws = new WebSocket(WS_URL);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log(`✅ WS OPEN — chatId=${chatId}`);
+      setIsConnected(true);
+      // Send init message
+      ws.send(JSON.stringify({ type: 'init', chatId }));
+      initSentRef.current = true;
+      console.log(`📤 init sent for chatId=${chatId}`);
+
+      // KEY FIX: If user clicked mic while WS was still connecting,
+      // start the mic now that the socket is confirmed open.
+      if (pendingMicStartRef.current) {
+        console.log('🎙️ pendingMicStart=true — starting mic after WS open');
+        pendingMicStartRef.current = false;
+        startMicrophoneStream();
+      }
+    };
+
+    ws.onmessage = handleMessage;
+
+    ws.onclose = (ev) => {
+      console.warn(`⚠️ WS CLOSED code=${ev.code} reason=${ev.reason}`);
+      setIsConnected(false);
+      initSentRef.current = false;
+    };
+
+    ws.onerror = (err) => {
+      console.error('❌ WS ERROR:', err);
+    };
+  };
+
+  // ─────────────────────────────────────────────────────
+  // Audio queue player
+  // ─────────────────────────────────────────────────────
+
+  const playNextAudio = useCallback(() => {
+    if (audioQueueRef.current.length === 0) {
+      isPlayingRef.current = false;
+      // Queue fully drained — AI is done speaking
+      console.log('🔇 Audio queue drained — isSpeaking = false');
+      setIsSpeaking(false);
+      return;
+    }
+
+    isPlayingRef.current = true;
+    setIsSpeaking(true);
+
+    const url = audioQueueRef.current.shift()!;
+    console.log(`▶️ Playing audio chunk, ${audioQueueRef.current.length} remaining`);
+    const audio = new Audio(url);
+    audioRef.current = audio;
+
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      playNextAudio();
+    };
+
+    audio.onerror = (e) => {
+      console.error('❌ Audio playback error:', e);
+      playNextAudio();
+    };
+
+    audio.play().catch((e) => {
+      console.error('❌ Audio play() failed:', e);
+      playNextAudio();
+    });
+  }, []);
+
+  const stopAudioPlayback = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = '';
+      audioRef.current = null;
+    }
+    audioQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+    setIsSpeaking(false);
+    console.log('🛑 Audio playback stopped and queue cleared');
+  }, []);
+
+  // ─────────────────────────────────────────────────────
+  // Fetch chats
+  // ─────────────────────────────────────────────────────
+
   const fetchChats = async () => {
-    console.log('📡 fetchChats: starting API call');
     try {
       const res = await fetch(`${API_URL}/api/chats`);
       const data = await res.json();
-
       setChats(
         data.map((chat: any) => ({
           ...chat,
           id: chat.id || Math.random().toString(36).substring(2, 9),
           createdAt: new Date(chat.created_at),
           updatedAt: new Date(chat.updated_at),
-          messages: chat.messages?.map((msg: any) => ({
-            ...msg,
-            id: msg.id || Math.random().toString(36).substring(2, 9),
-            timestamp: new Date(msg.timestamp)
-          })) || []
+          messages:
+            chat.messages?.map((msg: any) => ({
+              ...msg,
+              id: msg.id || Math.random().toString(36).substring(2, 9),
+              timestamp: new Date(msg.timestamp),
+            })) || [],
         }))
       );
-
       console.log('✅ fetchChats: received', data.length, 'chats');
     } catch (error) {
       console.error('❌ fetchChats failed', error);
     }
   };
 
-  // ── WebSocket connection (only when currentChatId changes)
- useEffect(() => {
-  if (!currentChatId) return;
+  // ─────────────────────────────────────────────────────
+  // Local UI message update (backend saves to DB)
+  // ─────────────────────────────────────────────────────
 
-  if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-    connectWebSocket(currentChatId);
-  }
-}, [currentChatId]);
-
-  const connectWebSocket = (chatId: string) => {
-  if (wsRef.current) {
-    if (
-      wsRef.current.readyState === WebSocket.OPEN ||
-      wsRef.current.readyState === WebSocket.CONNECTING
-    ) {
-      return;
-    }
-  }
-
-  console.log("🔌 Connecting WebSocket...");
-
-  wsRef.current = new WebSocket(WS_URL);
-
-  wsRef.current.onopen = () => {
-    console.log('✅ WebSocket connected');
-    setIsConnected(true);
-    initSentRef.current = false;
-    sendInit(chatId);
-  };
-
-  wsRef.current.onmessage = handleMessage;
-
-  wsRef.current.onclose = () => {
-    console.log('⚠️ WebSocket disconnected');
-    setIsConnected(false);
-  };
-
-  wsRef.current.onerror = (err) => {
-    console.error('❌ WebSocket error:', err);
-  };
-};
-
-  const sendInit = (chatId: string) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    if (initSentRef.current) return;
-
-    wsRef.current.send(JSON.stringify({ type: 'init', chatId }));
-    initSentRef.current = true;
-    console.log('📤 Sent init message for chat:', chatId);
-  };
-
-  // ── Create new chat
-  const createNewChat = async (): Promise<string | null> => {
-    try {
-      const res = await fetch(`${API_URL}/api/chats`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'New Voice Conversation' })
-      });
-      const chat = await res.json();
-      const newChat: Chat = {
-        ...chat,
-        id: chat.id || Math.random().toString(36).substring(2, 9),
-        createdAt: new Date(chat.created_at),
-        updatedAt: new Date(chat.updated_at),
-        messages: []
-      };
-
-      setChats((prev) => [newChat, ...prev]);
-      setCurrentChatId(newChat.id);
-      console.log('➕ Created new chat with id:', newChat.id);
-      return newChat.id;
-    } catch (error) {
-      console.error('❌ createNewChat failed', error);
-      return null;
-    }
-  };
-
-  // ── Add message
-  const addMessage = async (chatId: string, text: string, sender: 'user' | 'agent') => {
-    try {
-      const res = await fetch(`${API_URL}/api/messages`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text, sender })
-      });
-      const msg = await res.json();
-
+  const addMessageLocally = useCallback(
+    (chatId: string, text: string, sender: 'user' | 'agent') => {
       setChats((prev) =>
         prev.map((chat) => {
-          if (chat.id === chatId) {
-            const newMsg: Message = {
-              id: msg.id || Math.random().toString(36).substring(2, 9),
-              text: msg.text,
-              sender: msg.sender,
-              timestamp: new Date(msg.timestamp)
-            };
-
-            let title = chat.title;
-            if (chat.messages.length === 0 && sender === 'user') {
-              title = text.slice(0, 30) + (text.length > 30 ? '...' : '');
-            }
-
-            return {
-              ...chat,
-              title,
-              messages: [...chat.messages, newMsg],
-              updatedAt: new Date()
-            };
+          if (chat.id !== chatId) return chat;
+          const newMsg: Message = {
+            id: Math.random().toString(36).substring(2, 9),
+            text,
+            sender,
+            timestamp: new Date(),
+          };
+          let title = chat.title;
+          if (chat.messages.length === 0 && sender === 'user') {
+            title = text.slice(0, 40) + (text.length > 40 ? '...' : '');
           }
-          return chat;
+          return {
+            ...chat,
+            title,
+            messages: [...chat.messages, newMsg],
+            updatedAt: new Date(),
+          };
         })
       );
-    } catch (error) {
-      console.error('❌ addMessage failed', error);
-    }
-  };
+    },
+    []
+  );
 
-  // ── WebSocket message handler
-  const handleMessage = async (event: MessageEvent) => {
-    if (typeof event.data === 'string') {
-      const data = JSON.parse(event.data);
+  // ─────────────────────────────────────────────────────
+  // WebSocket message handler
+  // ─────────────────────────────────────────────────────
 
-      if (data.type === 'transcript') {
-        setCurrentTranscript(data.text);
-        setIsProcessing(true);
-      } else if (data.type === 'response') {
-        setIsProcessing(false);
-        setIsSpeaking(true);
-        if (currentChatId) await addMessage(currentChatId, data.text, 'agent');
-      } else if (data.type === 'error') {
-        console.error('❌ Server error:', data.message);
+  const handleMessage = useCallback(
+    async (event: MessageEvent) => {
+      if (typeof event.data === 'string') {
+        let data: any;
+        try {
+          data = JSON.parse(event.data);
+        } catch {
+          console.error('❌ Failed to parse WS message:', event.data);
+          return;
+        }
+
+        console.log('📩 WS message:', data.type);
+
+        if (data.type === 'transcript') {
+          setCurrentTranscript(data.text);
+          setIsProcessing(true);
+          const chatId = currentChatIdRef.current;
+          if (chatId) addMessageLocally(chatId, data.text, 'user');
+
+        } else if (data.type === 'response') {
+          setIsProcessing(false);
+          const chatId = currentChatIdRef.current;
+          if (chatId) addMessageLocally(chatId, data.text, 'agent');
+
+        } else if (data.type === 'stop_audio') {
+          console.log('🛑 stop_audio received — clearing audio queue');
+          stopAudioPlayback();
+          setIsProcessing(false);
+
+        } else if (data.type === 'tts_chunk_start') {
+          console.log(`🔊 TTS chunk ${data.sentence_index + 1}/${data.total} incoming`);
+          setIsSpeaking(true);
+
+        } else if (data.type === 'tts_done') {
+          // Do NOT set isSpeaking=false here — wait for audio queue to drain
+          // in playNextAudio → onended chain to avoid a race condition.
+          console.log('✅ tts_done received — waiting for audio queue to drain');
+
+        } else if (data.type === 'error') {
+          console.error('❌ Server error:', data.message);
+          setIsProcessing(false);
+          setIsSpeaking(false);
+        }
+
+      } else {
+        // Binary: audio chunk (MP3)
+        const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
+        const audioUrl = URL.createObjectURL(audioBlob);
+        audioQueueRef.current.push(audioUrl);
+        if (!isPlayingRef.current) {
+          playNextAudio();
+        }
       }
-    } else {
-      // Audio
-      const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl);
-      audio.onended = () => setIsSpeaking(false);
-      audio.play();
-    }
-  };
+    },
+    [addMessageLocally, stopAudioPlayback, playNextAudio]
+  );
 
-  // ── Microphone
+  // ─────────────────────────────────────────────────────
+  // Microphone
+  // ─────────────────────────────────────────────────────
+
   const startMicrophoneStream = async () => {
+    console.log('🎙️ startMicrophoneStream: requesting getUserMedia...');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
+      console.log('🎙️ getUserMedia granted');
 
       const audioContext = new AudioContext({ sampleRate: 16000 });
       audioContextRef.current = audioContext;
@@ -212,98 +325,213 @@ export const useVoiceWebSocket = () => {
       const source = audioContext.createMediaStreamSource(stream);
       sourceRef.current = source;
 
+      // 4096 is the nearest valid power-of-2 buffer size.
+      // 4096 / 480 = 8 full frames + 256 leftover samples per callback.
+      // We use a leftover buffer to carry partial samples across callbacks
+      // so every frame sent to the backend is exactly 480 samples.
       const processor = audioContext.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
 
+      let leftover = new Int16Array(0); // carry-over from previous callback
+      let framesSent = 0;
+      let framesDropped = 0;
+
       processor.onaudioprocess = (event) => {
         const inputData = event.inputBuffer.getChannelData(0);
-        const pcmData = new Int16Array(inputData.length);
+        const newPcm = new Int16Array(inputData.length);
+
+        // float32 → int16 PCM
         for (let i = 0; i < inputData.length; i++) {
           const s = Math.max(-1, Math.min(1, inputData[i]));
-          pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          newPcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
         }
 
+        // RMS amplitude for visualizer (0–255)
+        let sumSq = 0;
+        for (let i = 0; i < inputData.length; i++) sumSq += inputData[i] * inputData[i];
+        setAudioLevel(Math.min(255, Math.round(Math.sqrt(sumSq / inputData.length) * 255 * 8)));
+
+        // Prepend any leftover samples from last callback
+        const combined = new Int16Array(leftover.length + newPcm.length);
+        combined.set(leftover, 0);
+        combined.set(newPcm, leftover.length);
+
+        // Emit complete 480-sample frames
         const FRAME_SIZE = 480;
-        for (let offset = 0; offset + FRAME_SIZE <= pcmData.length; offset += FRAME_SIZE) {
-          const frame = pcmData.slice(offset, offset + FRAME_SIZE);
-          // 🔇 Silence detection
-let sum = 0;
-for (let i = 0; i < frame.length; i++) {
-  sum += Math.abs(frame[i]);
-}
-const avg = sum / frame.length;
+        let offset = 0;
+        while (offset + FRAME_SIZE <= combined.length) {
+          const frame = combined.slice(offset, offset + FRAME_SIZE);
+          offset += FRAME_SIZE;
 
-if (wsRef.current?.readyState === WebSocket.OPEN) {
-  wsRef.current.send(new Uint8Array(frame.buffer));
-}
+          // Always send every frame to the backend.
+          // The backend's WebRTC VAD decides what is speech vs silence.
+          // Dropping silence frames here prevents the VAD's silence_counter
+          // from ever reaching SILENCE_LIMIT, which means Whisper never fires.
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(new Uint8Array(frame.buffer));
+            framesSent++;
+            if (framesSent % 100 === 0) {
+              console.log(`🎙️ sent=${framesSent} dropped=${framesDropped}`);
+            }
+          } else {
+            framesDropped++;
+            if (framesDropped === 1 || framesDropped % 100 === 0) {
+              console.warn(`⚠️ WS not OPEN (state=${wsRef.current?.readyState}), frames dropped=${framesDropped}`);
+            }
+          }
         }
+
+        // Save incomplete trailing samples for next callback
+        leftover = combined.slice(offset);
       };
 
       source.connect(processor);
       processor.connect(audioContext.destination);
+
       setIsListening(true);
       setCurrentTranscript('');
+      console.log('✅ Microphone stream ACTIVE');
     } catch (err) {
       console.error('❌ Microphone error:', err);
+      pendingMicStartRef.current = false;
     }
   };
 
- const startListening = async () => {
-  let chatId = currentChatId;
+  const stopMicrophoneStream = () => {
+    console.log('🛑 stopMicrophoneStream');
+    processorRef.current?.disconnect();
+    sourceRef.current?.disconnect();
+    audioContextRef.current?.close().catch((e) => console.error('⚠️ AudioContext close:', e));
+    streamRef.current?.getTracks().forEach((t) => t.stop());
 
-  if (!chatId) {
-    chatId = await createNewChat();
-  }
+    processorRef.current = null;
+    sourceRef.current = null;
+    audioContextRef.current = null;
+    streamRef.current = null;
+    setAudioLevel(0);
+  };
 
-  if (!chatId) return;
+  // ─────────────────────────────────────────────────────
+  // Start / Stop Listening
+  // ─────────────────────────────────────────────────────
 
-  // Wait for websocket
-  if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-    connectWebSocket(chatId);
+  const startListening = async () => {
+    let chatId = currentChatIdRef.current;
+    console.log(`🎙️ startListening — chatId=${chatId} wsState=${wsRef.current?.readyState}`);
 
-    setTimeout(() => {
+    // Create a new chat if none is selected
+    if (!chatId) {
+      console.log('➕ Creating new chat...');
+      chatId = await createNewChat();
+    }
+    if (!chatId) {
+      console.error('❌ startListening: still no chatId, aborting');
+      return;
+    }
+
+    const wsState = wsRef.current?.readyState;
+
+    if (wsState === WebSocket.OPEN) {
+      // WS already connected — start mic immediately
+      console.log('🟢 WS OPEN — starting mic now');
       startMicrophoneStream();
-    }, 1000); // wait 1 sec
-  } else {
-    startMicrophoneStream();
-  }
-};
 
- const stopListening = () => {
+    } else {
+      // WS is CONNECTING or doesn't exist yet.
+      // Set the pending flag so ws.onopen will start the mic once the socket opens.
+      // The useEffect owns WS creation — don't create another socket here.
+      console.log(`🟡 WS not ready (state=${wsState}) — setting pendingMicStart`);
+      pendingMicStartRef.current = true;
 
-  // 👉 Tell backend to stop
-  if (wsRef.current?.readyState === WebSocket.OPEN) {
-    wsRef.current.send(
-      JSON.stringify({ type: 'command', command: 'stop' })
-    );
-  }
+      // If WS doesn't exist at all (e.g. chat was just created and effect hasn't run),
+      // kick off the connection manually now.
+      if (!wsRef.current) {
+        console.log('� No WS exists yet — opening now');
+        openWebSocket(chatId);
+      }
+      // If CONNECTING, the pending flag will be checked in its own ws.onopen
+    }
+  };
 
-  // Stop audio
-  processorRef.current?.disconnect();
-  sourceRef.current?.disconnect();
-  audioContextRef.current?.close();
-  streamRef.current?.getTracks().forEach((t) => t.stop());
+  const stopListening = () => {
+    console.log('🛑 stopListening');
+    pendingMicStartRef.current = false;
 
-  processorRef.current = null;
-  sourceRef.current = null;
-  audioContextRef.current = null;
-  streamRef.current = null;
+    // Tell backend to stop
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'command', command: 'stop' }));
+    }
 
-  setIsListening(false);
-  setIsProcessing(false); // ❗ change this
-};
+    stopMicrophoneStream();
+    stopAudioPlayback();
+
+    setIsListening(false);
+    setIsProcessing(false);
+    console.log('🛑 Listening stopped');
+  };
+
+  // ─────────────────────────────────────────────────────
+  // Chat Management
+  // ─────────────────────────────────────────────────────
+
+  const createNewChat = async (): Promise<string | null> => {
+    try {
+      const res = await fetch(`${API_URL}/api/chats`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'New Voice Conversation' }),
+      });
+      const chat = await res.json();
+
+      const newChat: Chat = {
+        ...chat,
+        id: chat.id || Math.random().toString(36).substring(2, 9),
+        createdAt: new Date(chat.created_at),
+        updatedAt: new Date(chat.updated_at),
+        messages: [],
+      };
+
+      setChats((prev) => [newChat, ...prev]);
+      setCurrentChatId(newChat.id);
+      currentChatIdRef.current = newChat.id; // sync ref immediately
+      console.log('➕ Created new chat:', newChat.id);
+      return newChat.id;
+    } catch (error) {
+      console.error('❌ createNewChat failed', error);
+      return null;
+    }
+  };
 
   const selectChat = (chatId: string) => {
+    if (chatId === currentChatIdRef.current) return;
+
+    console.log('💬 Switching to chat:', chatId);
+    pendingMicStartRef.current = false;
+
+    // Stop mic if active
+    if (streamRef.current) {
+      stopMicrophoneStream();
+      setIsListening(false);
+    }
+
+    stopAudioPlayback();
+    setIsProcessing(false);
+    setCurrentTranscript('');
     setCurrentChatId(chatId);
-    initSentRef.current = false;
-    sendInit(chatId);
+    // useEffect fires → openWebSocket(chatId)
   };
 
   const deleteChat = async (chatId: string) => {
     try {
       await fetch(`${API_URL}/api/chats/${chatId}`, { method: 'DELETE' });
       setChats((prev) => prev.filter((chat) => chat.id !== chatId));
-      if (currentChatId === chatId) setCurrentChatId(chats.length ? chats[0].id : null);
+
+      if (currentChatIdRef.current === chatId) {
+        const remaining = chats.filter((c) => c.id !== chatId);
+        const nextId = remaining.length ? remaining[0].id : null;
+        closeWebSocket();
+        setCurrentChatId(nextId);
+      }
     } catch (err) {
       console.error('❌ deleteChat failed', err);
     }
@@ -320,6 +548,7 @@ if (wsRef.current?.readyState === WebSocket.OPEN) {
     isProcessing,
     currentTranscript,
     isConnected,
+    audioLevel,
     createNewChat,
     selectChat,
     deleteChat,
